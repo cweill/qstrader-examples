@@ -4,8 +4,11 @@ load_dotenv()
 import operator
 import os
 
+import numpy as np
 import pandas as pd
+import plotly.express as px
 import pytz
+import streamlit as st
 from qstrader.alpha_model.alpha_model import AlphaModel
 from qstrader.alpha_model.fixed_signals import FixedSignalsAlphaModel
 from qstrader.asset.equity import Equity
@@ -139,11 +142,20 @@ class TopNMomentumAlphaModel(AlphaModel):
         return weights
 
 
-if __name__ == "__main__":
+@st.cache_data(ttl=3600, persist="disk")
+def run_strategy(end_dt):
+    """
+    Runs the momentum strategy and returns the results.
+    Results are cached to avoid recomputing on every Streamlit rerun.
+    Cache persists to disk and lasts for 1 hour.
+
+    Parameters
+    ----------
+    end_dt : pd.Timestamp, The end date for the backtest.
+    """
     # Duration of the backtest
     start_dt = pd.Timestamp("1998-12-22 14:30:00", tz=pytz.UTC)
     burn_in_dt = pd.Timestamp("1999-12-22 14:30:00", tz=pytz.UTC)
-    end_dt = pd.Timestamp("2024-12-31 23:59:00", tz=pytz.UTC)
 
     # Model parameters
     mom_lookback = 126  # Six months worth of business days
@@ -222,6 +234,10 @@ if __name__ == "__main__":
     )
     benchmark_backtest.run()
 
+    # Get the equity curves and inspect their structure
+    strategy_curve = strategy_backtest.get_equity_curve()
+    benchmark_curve = benchmark_backtest.get_equity_curve()
+
     # Performance Output
     tearsheet = TearsheetStatistics(
         strategy_equity=strategy_backtest.get_equity_curve(),
@@ -229,3 +245,293 @@ if __name__ == "__main__":
         title="US Sector Momentum - Top 3 Sectors",
     )
     tearsheet.plot_results()
+
+    # Instead of assuming column names, let's return the entire DataFrames
+    return {
+        "strategy_equity": strategy_curve,
+        "benchmark_equity": benchmark_curve,
+    }
+
+
+if __name__ == "__main__":
+    st.set_page_config(page_title="US Sector Momentum Strategy", layout="wide")
+
+    st.title("US Sector Momentum - Top 3 Sectors")
+
+    # Add a button to clear the cache
+    if st.button("Clear Cache and Rerun Strategy"):
+        st.cache_data.clear()
+        st.experimental_rerun()
+
+    # Convert date to timestamp with time and timezone
+    end_dt = pd.Timestamp("2024-12-31 23:59:00", tz=pytz.UTC)
+
+    with st.spinner(
+        "Running backtest strategy... (this may take a few minutes on first run)"
+    ):
+        results = run_strategy(end_dt)
+
+    # Get the equity curves
+    strategy_equity = results["strategy_equity"]["Equity"]  # Get the Equity series
+    benchmark_equity = results["benchmark_equity"]["Equity"]  # Get the Equity series
+
+    # Create returns data normalized to 100
+    returns_data = pd.DataFrame(
+        {
+            "Strategy": (strategy_equity / strategy_equity.iloc[0] - 1) * 100,
+            "Benchmark": (benchmark_equity / benchmark_equity.iloc[0] - 1) * 100,
+        }
+    )
+    fig_returns = px.line(
+        returns_data,
+        title="Cumulative Returns (%)",
+    )
+    fig_returns.update_layout(yaxis_title="Return (%)")
+    st.plotly_chart(fig_returns)
+
+    # with col2:
+    #     st.subheader("Portfolio Value")
+    #     # Create value data
+    #     value_data = pd.DataFrame(
+    #         {
+    #             "Strategy": strategy_equity / 1_000_000,
+    #             "Benchmark": benchmark_equity / 1_000_000,
+    #         }
+    #     )
+    #     fig_value = px.line(
+    #         value_data,
+    #         title="Portfolio Value (Multiple of Initial Investment)",
+    #     )
+    #     fig_value.update_layout(yaxis_title="Value (Multiple of Initial)")
+    #     st.plotly_chart(fig_value)
+
+    # Calculate returns with datetime index
+    strategy_returns = strategy_equity.pct_change().dropna()
+    benchmark_returns = benchmark_equity.pct_change().dropna()
+
+    # Calculate drawdowns (fix the percentage calculation)
+    strategy_drawdown = (
+        strategy_equity / strategy_equity.cummax() - 1
+    )  # Remove the *100 here
+    benchmark_drawdown = (
+        benchmark_equity / benchmark_equity.cummax() - 1
+    )  # Remove the *100 here
+
+    # Create drawdown chart
+    drawdown_data = pd.DataFrame(
+        {
+            "Strategy": strategy_drawdown
+            * 100,  # Convert to percentage here for display
+            "Benchmark": benchmark_drawdown
+            * 100,  # Convert to percentage here for display
+        }
+    )
+
+    fig_drawdown = px.line(
+        drawdown_data,
+        title="Drawdown (%)",
+    )
+    fig_drawdown.update_layout(yaxis_title="Drawdown (%)", showlegend=True, height=300)
+    st.plotly_chart(fig_drawdown)
+    # Ensure we have a datetime index
+    if not isinstance(strategy_returns.index, pd.DatetimeIndex):
+        strategy_returns.index = pd.to_datetime(strategy_returns.index)
+    if not isinstance(benchmark_returns.index, pd.DatetimeIndex):
+        benchmark_returns.index = pd.to_datetime(benchmark_returns.index)
+
+    # Calculate metrics
+    total_days = len(strategy_returns)
+    ann_factor = np.sqrt(252)  # Annualization factor for daily data
+
+    # Calculate CAGR
+    total_return_strategy = (strategy_equity.iloc[-1] / strategy_equity.iloc[0]) - 1
+    total_return_benchmark = (benchmark_equity.iloc[-1] / benchmark_equity.iloc[0]) - 1
+    years = total_days / 252
+    cagr_strategy = (1 + total_return_strategy) ** (1 / years) - 1
+    cagr_benchmark = (1 + total_return_benchmark) ** (1 / years) - 1
+
+    # Calculate Sortino Ratio (using 0% as minimum acceptable return)
+    downside_returns_strat = strategy_returns[strategy_returns < 0]
+    downside_returns_bench = benchmark_returns[benchmark_returns < 0]
+    downside_std_strat = np.sqrt(252) * np.sqrt(np.mean(downside_returns_strat**2))
+    downside_std_bench = np.sqrt(252) * np.sqrt(np.mean(downside_returns_bench**2))
+    sortino_ratio_strat = (strategy_returns.mean() * 252) / downside_std_strat
+    sortino_ratio_bench = (benchmark_returns.mean() * 252) / downside_std_bench
+
+    # Calculate drawdown durations
+    def get_drawdown_duration(equity_series):
+        """
+        Calculate the maximum drawdown duration in days.
+
+        Parameters
+        ----------
+        equity_series : pd.Series
+            The equity curve series
+
+        Returns
+        -------
+        int
+            The maximum drawdown duration in days
+        """
+        # Calculate drawdown series
+        drawdown = equity_series / equity_series.cummax() - 1
+
+        # Find drawdown periods
+        is_drawdown = drawdown < 0
+
+        # If no drawdown, return 0
+        if not is_drawdown.any():
+            return 0
+
+        # Find start of each drawdown period
+        drawdown_starts = (is_drawdown != is_drawdown.shift()).cumsum()[is_drawdown]
+
+        # Group by drawdown period and count days
+        drawdown_durations = drawdown_starts.groupby(drawdown_starts).size()
+
+        # Return the maximum duration
+        return int(drawdown_durations.max())
+
+    metrics = pd.DataFrame(
+        {
+            "Strategy": [
+                total_return_strategy,  # Total Return
+                cagr_strategy,  # CAGR
+                strategy_returns.mean()
+                * 252
+                / (strategy_returns.std() * ann_factor),  # Sharpe
+                sortino_ratio_strat,  # Sortino
+                strategy_returns.std() * ann_factor,  # Annual Volatility
+                strategy_drawdown.min(),  # Max Drawdown (now as decimal)
+                get_drawdown_duration(strategy_equity),  # Max Drawdown Duration
+            ],
+            "Benchmark": [
+                total_return_benchmark,
+                cagr_benchmark,
+                benchmark_returns.mean() * 252 / (benchmark_returns.std() * ann_factor),
+                sortino_ratio_bench,
+                benchmark_returns.std() * ann_factor,
+                benchmark_drawdown.min(),  # Max Drawdown (now as decimal)
+                get_drawdown_duration(benchmark_equity),
+            ],
+        },
+        index=[
+            "Total Return",
+            "CAGR",
+            "Sharpe Ratio",
+            "Sortino Ratio",
+            "Annual Volatility",
+            "Max Daily Drawdown",
+            "Max Drawdown Duration (Days)",
+        ],
+    )
+
+    # Create a row for the returns charts
+    st.subheader("Returns Analysis")
+    col3, col4 = st.columns(2)
+
+    with col3:
+        # Monthly Returns Heatmap
+        st.subheader("Monthly Returns (%)")
+
+        # Calculate monthly returns with proper datetime index
+        monthly_returns = (
+            strategy_returns.resample("M").apply(lambda x: (1 + x).prod() - 1) * 100
+        )
+
+        # Ensure we have enough complete years for the matrix
+        n_years = len(monthly_returns) // 12
+        monthly_values = monthly_returns.values[
+            : n_years * 12
+        ]  # Only use complete years
+
+        # Create monthly returns matrix
+        monthly_matrix = pd.DataFrame(
+            monthly_values.reshape(n_years, 12),
+            index=monthly_returns.index.year.unique()[:n_years],
+            columns=[
+                "Jan",
+                "Feb",
+                "Mar",
+                "Apr",
+                "May",
+                "Jun",
+                "Jul",
+                "Aug",
+                "Sep",
+                "Oct",
+                "Nov",
+                "Dec",
+            ],
+        )
+
+        # Create heatmap
+        fig_monthly = px.imshow(
+            monthly_matrix,
+            color_continuous_scale="RdYlGn",  # Red to Yellow to Green scale
+            aspect="auto",
+            title="Monthly Returns Heatmap (%)",
+        )
+        fig_monthly.update_traces(text=monthly_matrix.round(1), texttemplate="%{text}")
+        fig_monthly.update_layout(
+            coloraxis_colorbar_title="Return (%)",
+            xaxis_title="",
+            yaxis_title="Year",
+            height=400,
+        )
+        st.plotly_chart(fig_monthly)
+
+    with col4:
+        # Yearly Returns Bar Chart
+        st.subheader("Yearly Returns (%)")
+
+        # Calculate yearly returns
+        yearly_returns = (
+            strategy_returns.resample("Y").apply(lambda x: (1 + x).prod() - 1) * 100
+        )
+        yearly_returns.index = yearly_returns.index.year
+
+        # Create bar chart
+        fig_yearly = px.bar(
+            x=yearly_returns.index,
+            y=yearly_returns.values,
+            title="Yearly Returns (%)",
+            labels={"x": "Year", "y": "Return (%)"},
+        )
+        fig_yearly.update_layout(showlegend=False, height=400)
+        # Add horizontal line at y=0
+        fig_yearly.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+        st.plotly_chart(fig_yearly)
+
+    # Display performance metrics
+    st.subheader("Performance Metrics")
+
+    # Format the metrics table
+    formatted_metrics = metrics.copy()
+    # Format percentages
+    for col in formatted_metrics.columns:
+        formatted_metrics.loc["Total Return", col] = (
+            f"{metrics.loc['Total Return', col]:.2%}"
+        )
+        formatted_metrics.loc["CAGR", col] = f"{metrics.loc['CAGR', col]:.2%}"
+        formatted_metrics.loc["Annual Volatility", col] = (
+            f"{metrics.loc['Annual Volatility', col]:.2%}"
+        )
+        formatted_metrics.loc["Max Daily Drawdown", col] = (
+            f"{metrics.loc['Max Daily Drawdown', col]:.2%}"
+        )
+
+    # Format ratios to 2 decimal places
+    formatted_metrics.loc["Sharpe Ratio"] = metrics.loc["Sharpe Ratio"].map(
+        "{:.2f}".format
+    )
+    formatted_metrics.loc["Sortino Ratio"] = metrics.loc["Sortino Ratio"].map(
+        "{:.2f}".format
+    )
+
+    # Format duration as integer
+    formatted_metrics.loc["Max Drawdown Duration (Days)"] = metrics.loc[
+        "Max Drawdown Duration (Days)"
+    ].map("{:.0f}".format)
+
+    st.dataframe(formatted_metrics)
