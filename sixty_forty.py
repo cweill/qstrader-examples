@@ -10,6 +10,7 @@ import os
 
 import pandas as pd
 import pytz
+import streamlit as st
 from qstrader.alpha_model.fixed_signals import FixedSignalsAlphaModel
 from qstrader.asset.equity import Equity
 from qstrader.asset.universe.static import StaticUniverse
@@ -18,12 +19,15 @@ from qstrader.data.daily_bar_csv import CSVDailyBarDataSource
 from qstrader.statistics.tearsheet import TearsheetStatistics
 from qstrader.trading.backtest import BacktestTradingSession
 
-if __name__ == "__main__":
+from streamlit_utils import plot_strategy_results
+
+
+@st.cache_data(ttl=3600, persist="disk")
+def run_strategy(end_dt):
     # Also please note that at this stage of QSTrader development, for the 'buy & hold'
     # methodology used below it is necessary to specify a starting time of 14:30:00 UTC
     # in order for the backtest to proceed correctly.
     start_dt = pd.Timestamp("2003-09-30 14:30:00", tz=pytz.UTC)
-    end_dt = pd.Timestamp("2024-12-31 23:59:00", tz=pytz.UTC)
 
     # Construct the symbols and assets necessary for the backtest
     strategy_symbols = ["SPY", "AGG"]
@@ -79,3 +83,33 @@ if __name__ == "__main__":
         title="60/40 US Equities/Bonds",
     )
     tearsheet.plot_results()
+
+    return {
+        "strategy_equity": strategy_backtest.get_equity_curve(),
+        "benchmark_equity": benchmark_backtest.get_equity_curve(),
+    }
+
+
+if __name__ == "__main__":
+    st.set_page_config(page_title="60/40 US Equities/Bonds", layout="wide")
+
+    st.title("60/40 US Equities/Bonds")
+
+    # Add a button to clear the cache
+    if st.button("Clear Cache and Rerun Strategy"):
+        st.cache_data.clear()
+        st.experimental_rerun()
+
+    # Convert date to timestamp with time and timezone
+    end_dt = pd.Timestamp("2024-12-31 23:59:00", tz=pytz.UTC)
+
+    with st.spinner(
+        "Running backtest strategy... (this may take a few minutes on first run)"
+    ):
+        results = run_strategy(end_dt)
+
+    # Get the equity curves
+    strategy_equity = results["strategy_equity"]["Equity"]  # Get the Equity series
+    benchmark_equity = results["benchmark_equity"]["Equity"]  # Get the Equity series
+
+    plot_strategy_results(strategy_equity, benchmark_equity)
